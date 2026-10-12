@@ -105,6 +105,7 @@ cmake --build first-homework/Mortis/build -j
 | 最大丢失帧数 | 8 | `kMaxLostFrames` | 遮挡外推时长 |
 | 箭头缩放 | 4.5 | `kArrowScale` | 速度 → 箭头长度 |
 | 箭头长度范围 | 25 ~ 140 | `kArrowMinLen` / `kArrowMaxLen` | 避免观感失衡 |
+| 速度平滑系数 | 0.35 | `kSmoothAlpha` | 箭头防抖（越小越平滑） |
 | 轨迹长度 | 30 | `kMaxTrail` | 彗尾保留帧数 |
 | 快色参考速度 | 30 px/帧 | `kFastSpeedRef` | 速度达到该值时箭头变红 |
 

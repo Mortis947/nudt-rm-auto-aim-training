@@ -64,6 +64,9 @@ constexpr int kMaxTrail = 30;
 // 速度变色参考值（像素/帧）：速度达到该值时箭头显示为红色
 constexpr double kFastSpeedRef = 30.0;
 
+// 速度平滑系数（EMA）：越小越平滑，用于抑制箭头方向/长度的帧间抖动
+constexpr double kSmoothAlpha = 0.35;
+
 // ---------------------------------------------------------------------------
 // 数据结构
 // ---------------------------------------------------------------------------
@@ -81,9 +84,10 @@ struct BallCandidate {
 // 当前帧的跟踪状态
 struct BallTrack {
   cv::Point2f center;
-  cv::Point2f velocity;   // 相邻帧位移（像素/帧），方向即运动方向
+  cv::Point2f velocity;         // 相邻帧真实位移（像素/帧），用于位置预测
+  cv::Point2f smooth_velocity;  // EMA 平滑后的速度（像素/帧），用于箭头显示
   float radius = 0.0F;
-  double speed = 0.0;     // 速度大小（像素/帧）
+  double speed = 0.0;           // 平滑速度大小（像素/帧）
   cv::Rect bounding_box;
   int lost_frames = 0;
   bool initialized = false;
@@ -276,7 +280,7 @@ void drawTrackOverlay(cv::Mat & frame, const BallTrack & current, const BallTrac
   const double prev_speed_pps = previous.speed * fps;
   const double delta_pps = speed_pps - prev_speed_pps;
 
-  cv::Point2f arrow = current.velocity;
+  cv::Point2f arrow = current.smooth_velocity;
   if (cv::norm(arrow) < 1.0F) {
     arrow = cv::Point2f(30.0F, 0.0F);  // 静止时给个默认方向，避免箭头消失
   }
@@ -350,12 +354,15 @@ int main(int argc, char ** argv)
       current.lost_frames = 0;
 
       if (previous.initialized) {
-        current.velocity = current.center - previous.center;
-        current.speed = cv::norm(current.velocity);
+        const cv::Point2f raw_velocity = current.center - previous.center;
+        current.velocity = raw_velocity;
+        current.smooth_velocity =
+          kSmoothAlpha * raw_velocity + (1.0 - kSmoothAlpha) * previous.smooth_velocity;
       } else {
         current.velocity = cv::Point2f(0.0F, 0.0F);
-        current.speed = 0.0;
+        current.smooth_velocity = cv::Point2f(0.0F, 0.0F);
       }
+      current.speed = cv::norm(current.smooth_velocity);
 
       trail.push_back(current.center);
       if (trail.size() > kMaxTrail) {
