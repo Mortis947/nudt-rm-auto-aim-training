@@ -2,19 +2,20 @@
 // 绿球识别与运动追踪（Week1 作业）
 //
 // 目标：从视频中检测绿色小球，用圆形框标出位置，用箭头表示运动方向，
-//       箭头长度表示速度大小，并显示实时速度与加减速状态。
+//       箭头长度表示速度大小、颜色随速度变化，并标注球的大小。
 //
 // 处理流水线（每帧执行）：
 //   1. 绿色分割：BGR -> HSV，阈值提取绿色区域，开+闭运算去噪
 //   2. 候选筛选：轮廓 -> 面积/圆度/长宽比过滤，区分绿球与绿色圆柱
 //   3. 跨帧匹配：形状打分 + 上一帧速度预测位置，抑制目标跳变
 //   4. 遮挡外推：短时丢失用速度外推位置，避免贴边时中断
-//   5. 可视化：检测圆 + 速度箭头 + 状态文本，逐帧写入输出视频
+//   5. 可视化：检测圆 + 速度箭头(随速度变色) + 球大小/速度文本 + 运动轨迹
 
 #include <opencv2/opencv.hpp>
 
 #include <algorithm>
 #include <cmath>
+#include <deque>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
@@ -56,6 +57,12 @@ constexpr int kMaxLostFrames = 8;
 constexpr double kArrowScale = 4.5;
 constexpr double kArrowMinLen = 25.0;
 constexpr double kArrowMaxLen = 140.0;
+
+// 运动轨迹：保留最近 N 帧位置绘制"彗尾"
+constexpr int kMaxTrail = 30;
+
+// 速度变色参考值（像素/帧）：速度达到该值时箭头显示为红色
+constexpr double kFastSpeedRef = 30.0;
 
 // ---------------------------------------------------------------------------
 // 数据结构
@@ -235,6 +242,28 @@ std::string buildStatusText(double speed_pps, double delta_pps)
   return ss.str();
 }
 
+// 速度 → 箭头颜色：绿(慢) → 黄(中) → 红(快)
+cv::Scalar speedToColor(double speed)
+{
+  const double t = std::clamp(speed / kFastSpeedRef, 0.0, 1.0);
+  const int red = static_cast<int>(255.0 * std::min(1.0, 2.0 * t));
+  const int green = static_cast<int>(255.0 * std::min(1.0, 2.0 * (1.0 - t)));
+  return cv::Scalar(0, green, red);  // BGR
+}
+
+// 绘制运动轨迹（彗尾）：旧点偏绿、新点偏红
+void drawTrail(cv::Mat & frame, const std::deque<cv::Point2f> & trail)
+{
+  if (trail.size() < 2) {
+    return;
+  }
+  for (size_t i = 1; i < trail.size(); ++i) {
+    const double t = static_cast<double>(i) / static_cast<double>(trail.size() - 1);
+    const cv::Scalar color(0, static_cast<int>(255.0 * (1.0 - t)), static_cast<int>(255.0 * t));
+    cv::line(frame, trail[i - 1], trail[i], color, 2, cv::LINE_AA);
+  }
+}
+
 // 绘制检测圆、速度箭头和状态文本
 void drawTrackOverlay(cv::Mat & frame, const BallTrack & current, const BallTrack & previous,
   double fps, int frame_index, bool predicted)
@@ -255,7 +284,7 @@ void drawTrackOverlay(cv::Mat & frame, const BallTrack & current, const BallTrac
   const double len = std::clamp(current.speed * kArrowScale, kArrowMinLen, kArrowMaxLen);
   const cv::Point2f dir = arrow * static_cast<float>(len / cv::norm(arrow));
   const cv::Point2f end = current.center + dir;
-  cv::arrowedLine(frame, current.center, end, cv::Scalar(255, 64, 64), 3, cv::LINE_AA, 0, 0.28);
+  cv::arrowedLine(frame, current.center, end, speedToColor(current.speed), 3, cv::LINE_AA, 0, 0.28);
 
   const cv::Point anchor(std::max(20, current.bounding_box.x - 20),
     std::max(40, current.bounding_box.y - 16));
@@ -263,6 +292,13 @@ void drawTrackOverlay(cv::Mat & frame, const BallTrack & current, const BallTrac
     cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
   cv::putText(frame, buildStatusText(speed_pps, delta_pps), anchor + cv::Point(0, 28),
     cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 255), 2, cv::LINE_AA);
+
+  // 球的大小标注（半径）
+  const std::string size_text =
+    "r: " + std::to_string(static_cast<int>(std::round(current.radius))) + " px";
+  cv::putText(frame, size_text, anchor + cv::Point(0, 56),
+    cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 0), 2, cv::LINE_AA);
+
   cv::putText(frame, "frame: " + std::to_string(frame_index), cv::Point(20, 36),
     cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(255, 255, 255), 2, cv::LINE_AA);
 }
@@ -298,6 +334,7 @@ int main(int argc, char ** argv)
   }
 
   BallTrack previous;
+  std::deque<cv::Point2f> trail;
   int frame_index = 0;
 
   for (cv::Mat frame; capture.read(frame); ++frame_index) {
@@ -320,6 +357,11 @@ int main(int argc, char ** argv)
         current.speed = 0.0;
       }
 
+      trail.push_back(current.center);
+      if (trail.size() > kMaxTrail) {
+        trail.pop_front();
+      }
+      drawTrail(frame, trail);
       drawTrackOverlay(frame, current, previous, fps, frame_index, false);
       previous = current;
     } else if (previous.initialized && previous.lost_frames < kMaxLostFrames) {
@@ -332,9 +374,15 @@ int main(int argc, char ** argv)
       predicted.bounding_box.height = static_cast<int>(std::round(predicted.radius * 2.0F));
       predicted.lost_frames = previous.lost_frames + 1;
 
+      trail.push_back(predicted.center);
+      if (trail.size() > kMaxTrail) {
+        trail.pop_front();
+      }
+      drawTrail(frame, trail);
       drawTrackOverlay(frame, predicted, previous, fps, frame_index, true);
       previous = predicted;
     } else {
+      trail.clear();
       cv::putText(frame, "green ball lost", cv::Point(20, 36), cv::FONT_HERSHEY_SIMPLEX, 0.8,
         cv::Scalar(0, 0, 255), 2, cv::LINE_AA);
       previous = BallTrack{};
