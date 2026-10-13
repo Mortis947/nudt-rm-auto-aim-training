@@ -12,6 +12,7 @@
 //   5. 可视化：检测圆 + 速度箭头(随速度变色) + 球大小/速度文本 + 运动轨迹
 
 #include <opencv2/opencv.hpp>
+#include <opencv2/freetype.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -86,6 +87,12 @@ constexpr double kDefaultFps = 30.0;
 // 速度平滑系数（EMA）：越小越平滑，用于抑制箭头方向/长度的帧间抖动
 constexpr double kSmoothAlpha = 0.35;
 
+// 黑体（SimHei）候选路径：优先 Windows 字体（WSL 可访问），失败回退到内置字体
+const char * const kFontPaths[] = {
+  "/mnt/c/Windows/Fonts/simhei.ttf",
+  "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+};
+
 // ---------------------------------------------------------------------------
 // 数据结构
 // ---------------------------------------------------------------------------
@@ -107,6 +114,7 @@ struct BallTrack {
   cv::Point2f smooth_velocity;  // EMA 平滑后的速度（像素/帧），用于箭头显示
   float radius = 0.0F;
   double speed = 0.0;           // 平滑速度大小（像素/帧）
+  double confidence = 0.0;      // 检测置信度（0~1），来自形状打分
   cv::Rect bounding_box;
   int lost_frames = 0;
   bool initialized = false;
@@ -211,7 +219,8 @@ double computeShapeScore(const BallCandidate & c)
 
 // 从候选中选出最可能的目标：形状分 + 跨帧运动连续性
 std::optional<BallCandidate> chooseBestCandidate(
-  const std::vector<BallCandidate> & candidates, const BallTrack & previous)
+  const std::vector<BallCandidate> & candidates, const BallTrack & previous,
+  double * confidence = nullptr)
 {
   if (candidates.empty()) {
     return std::nullopt;
@@ -252,6 +261,9 @@ std::optional<BallCandidate> chooseBestCandidate(
   if (best == nullptr) {
     return std::nullopt;
   }
+  if (confidence != nullptr) {
+    *confidence = computeShapeScore(*best);
+  }
   return *best;
 }
 
@@ -277,6 +289,73 @@ cv::Scalar speedToColor(double speed)
   const int red = static_cast<int>(255.0 * std::min(1.0, 2.0 * t));
   const int green = static_cast<int>(255.0 * std::min(1.0, 2.0 * (1.0 - t)));
   return cv::Scalar(0, green, red);  // BGR
+}
+
+// 惰性加载黑体（SimHei）；成功返回字体对象，失败返回空指针（回退到内置字体）
+cv::Ptr<cv::freetype::FreeType2> getFont()
+{
+  static const cv::Ptr<cv::freetype::FreeType2> font = []() {
+    auto f = cv::freetype::createFreeType2();
+    for (const char * path : kFontPaths) {
+      std::error_code ec;
+      if (std::filesystem::exists(path, ec) && !ec) {
+        f->loadFontData(path, 0);
+        return f;
+      }
+    }
+    return cv::Ptr<cv::freetype::FreeType2>();
+  }();
+  return font;
+}
+
+// 统一文字绘制：优先黑体，失败回退 OpenCV 内置字体（org 均为文本左上角）
+void drawText(cv::Mat & frame, const std::string & text, cv::Point org,
+  int font_height, cv::Scalar color, int thickness)
+{
+  const auto font = getFont();
+  if (font) {
+    font->putText(frame, text, org, font_height, color, thickness, cv::LINE_AA, false);
+  } else {
+    const double scale = static_cast<double>(font_height) / 28.0;
+    cv::putText(frame, text, org + cv::Point(0, font_height), cv::FONT_HERSHEY_DUPLEX,
+      scale, color, thickness, cv::LINE_AA);
+  }
+}
+
+// 绘制 YOLO 风格标签：目标框上方背景色块 + 「类名 置信度」白字
+void drawYoloLabel(cv::Mat & frame, const std::string & label, const cv::Rect & box,
+  cv::Scalar bg_color, int font_height)
+{
+  const auto font = getFont();
+  const int thickness = -1;  // 实心填充
+
+  cv::Size text_size;
+  if (font) {
+    int baseline = 0;
+    text_size = font->getTextSize(label, font_height, thickness, &baseline);
+  } else {
+    int baseline = 0;
+    text_size = cv::getTextSize(label, cv::FONT_HERSHEY_DUPLEX,
+      static_cast<double>(font_height) / 28.0, 2, &baseline);
+  }
+
+  const int pad_x = 8;
+  const int pad_y = 4;
+  cv::Point tl(box.x, box.y - text_size.height - pad_y * 2);
+  if (tl.y < 0) {
+    tl.y = box.y + 2;  // 贴顶边时放到框内，避免越界
+  }
+  cv::rectangle(frame, cv::Rect(tl.x, tl.y, text_size.width + pad_x * 2,
+    text_size.height + pad_y * 2), bg_color, cv::FILLED);
+
+  if (font) {
+    font->putText(frame, label, cv::Point(tl.x + pad_x, tl.y + pad_y), font_height,
+      cv::Scalar(255, 255, 255), thickness, cv::LINE_AA, false);
+  } else {
+    cv::putText(frame, label, cv::Point(tl.x + pad_x, tl.y + pad_y + text_size.height),
+      cv::FONT_HERSHEY_DUPLEX, static_cast<double>(font_height) / 28.0,
+      cv::Scalar(255, 255, 255), 2, cv::LINE_AA);
+  }
 }
 
 // 绘制运动轨迹（彗尾）：旧点偏绿、新点偏红
@@ -315,10 +394,22 @@ void drawTrackOverlay(cv::Mat & frame, const BallTrack & current, const BallTrac
       3, cv::LINE_AA, 0, 0.28);
   }
 
-  const cv::Point anchor(std::max(20, current.bounding_box.x - 20),
-    std::max(40, current.bounding_box.y - 16));
-  cv::putText(frame, predicted ? "green ball predicted" : "green ball", anchor,
-    cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
+  // YOLO 风格标签：类名 + 置信度，贴在目标框上方（外推时用灰色背景区分）。
+  {
+    std::ostringstream label_ss;
+    label_ss << "green ball " << std::fixed << std::setprecision(2) << current.confidence;
+    const cv::Scalar label_bg = predicted ? cv::Scalar(110, 110, 110) : cv::Scalar(0, 180, 0);
+    drawYoloLabel(frame, label_ss.str(), current.bounding_box, label_bg, 24);
+  }
+
+  // 其余文字固定绘制在左上角，避免遮挡运动中的小球。
+  constexpr int kTextLeft = 20;
+  constexpr int kTextLine = 40;
+  int text_y = 32;
+
+  drawText(frame, "frame: " + std::to_string(frame_index),
+    cv::Point(kTextLeft, text_y), 22, cv::Scalar(255, 255, 255), -1);
+  text_y += kTextLine;
 
   // 外推期间的速度只是沿用上次观测值；重获目标的第一帧也不计算跨越丢失区间的瞬时速度。
   std::string status_text;
@@ -332,17 +423,15 @@ void drawTrackOverlay(cv::Mat & frame, const BallTrack & current, const BallTrac
   } else {
     status_text = buildStatusText(speed_pps, delta_pps);
   }
-  cv::putText(frame, status_text, anchor + cv::Point(0, 28),
-    cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 255), 2, cv::LINE_AA);
+  drawText(frame, status_text, cv::Point(kTextLeft, text_y), 24,
+    cv::Scalar(255, 255, 255), -1);
+  text_y += kTextLine;
 
   // 球的大小标注（图像中的像素半径，不是现实世界长度）
   const std::string size_text =
     "r: " + std::to_string(static_cast<int>(std::round(current.radius))) + " px";
-  cv::putText(frame, size_text, anchor + cv::Point(0, 56),
-    cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 0), 2, cv::LINE_AA);
-
-  cv::putText(frame, "frame: " + std::to_string(frame_index), cv::Point(20, 36),
-    cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(255, 255, 255), 2, cv::LINE_AA);
+  drawText(frame, size_text, cv::Point(kTextLeft, text_y), 24,
+    cv::Scalar(255, 255, 0), -1);
 }
 
 }  // namespace
@@ -422,13 +511,15 @@ int main(int argc, char ** argv)
     }
 
     const auto candidates = detectBallCandidates(frame);
-    const auto selected = chooseBestCandidate(candidates, previous);
+    double confidence = 0.0;
+    const auto selected = chooseBestCandidate(candidates, previous, &confidence);
 
     if (selected.has_value()) {
       BallTrack current;
       current.center = selected->center;
       current.radius = selected->radius;
       current.bounding_box = selected->bounding_box;
+      current.confidence = confidence;
       current.initialized = true;
       current.lost_frames = 0;
 
@@ -472,8 +563,7 @@ int main(int argc, char ** argv)
       previous = predicted;
     } else {
       trail.clear();
-      cv::putText(frame, "green ball lost", cv::Point(20, 36), cv::FONT_HERSHEY_SIMPLEX, 0.8,
-        cv::Scalar(0, 0, 255), 2, cv::LINE_AA);
+      drawText(frame, "green ball lost", cv::Point(20, 36), 28, cv::Scalar(0, 0, 255), -1);
       previous = BallTrack{};
     }
 
