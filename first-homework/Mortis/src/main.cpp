@@ -23,6 +23,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <vector>
 
 namespace {
@@ -31,13 +32,22 @@ namespace {
 // 可调参数（换视频时主要改这里）
 // ---------------------------------------------------------------------------
 
-// 绿色 HSV 范围（OpenCV 中 H ∈ [0,180]，绿色约 35~95）
+// 绿色 HSV 范围（8 位 HSV 图像中，OpenCV 的 H 通常为 [0,179]；范围需按实际视频调试）
 const cv::Scalar kLowerGreen(35, 45, 40);
 const cv::Scalar kUpperGreen(95, 255, 255);
 
 // 轮廓面积范围：绿球在这个视频里比较大，按像素面积卡一个合理区间
 constexpr double kMinArea = 7000.0;
 constexpr double kMaxArea = 32000.0;
+
+// 形状打分参数：与上面的筛选阈值分开管理，便于调参
+constexpr double kScoreCircularityStart = 0.68;
+constexpr double kScoreCircularityRange = 0.12;
+constexpr double kTargetArea = 12000.0;
+constexpr double kAreaScoreTolerance = 10000.0;
+constexpr double kDistancePenalty = 0.01;
+constexpr double kRadiusPenalty = 0.02;
+constexpr double kMaxRadiusChangeRatio = 0.45;
 
 // 正常帧的形状阈值：圆度（=4πA/P²，理想圆为 1）和长宽比（w/h）
 constexpr double kMinCircularity = 0.68;
@@ -63,6 +73,15 @@ constexpr int kMaxTrail = 30;
 
 // 速度变色参考值（像素/帧）：速度达到该值时箭头显示为红色
 constexpr double kFastSpeedRef = 30.0;
+
+// 速度低于此阈值时不画箭头，避免静止目标仍显示一个虚假的方向
+constexpr double kMinArrowSpeed = 1.0;
+
+// 小于该速度变化量时，状态文本显示 stable，以减少轻微抖动造成的闪烁
+constexpr double kStableSpeedDeltaPps = 2.0;
+
+// 元数据无法提供有效 FPS 时采用的显示/输出假设值；此时速度只是近似值
+constexpr double kDefaultFps = 30.0;
 
 // 速度平滑系数（EMA）：越小越平滑，用于抑制箭头方向/长度的帧间抖动
 constexpr double kSmoothAlpha = 0.35;
@@ -122,8 +141,9 @@ std::vector<BallCandidate> detectBallCandidates(const cv::Mat & frame)
   cv::Mat mask;
   cv::inRange(hsv, kLowerGreen, kUpperGreen, mask);
 
-  // 开运算去噪点，闭运算填空洞
-  const cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5));
+  // 开运算去噪点，闭运算填空洞。结构元素固定，因此只创建一次并复用。
+  static const cv::Mat kernel =
+    cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5));
   cv::morphologyEx(mask, mask, cv::MORPH_OPEN, kernel);
   cv::morphologyEx(mask, mask, cv::MORPH_CLOSE, kernel);
 
@@ -179,9 +199,13 @@ std::vector<BallCandidate> detectBallCandidates(const cv::Mat & frame)
 // 形状打分：分数越高越像"球"
 double computeShapeScore(const BallCandidate & c)
 {
-  const double circularity_score = std::clamp((c.circularity - 0.68) / 0.12, 0.0, 1.0);
-  const double aspect_score = std::clamp(1.0 - std::abs(c.aspect_ratio - 1.0) / 0.20, 0.0, 1.0);
-  const double area_score = std::clamp(1.0 - std::abs(c.area - 12000.0) / 10000.0, 0.0, 1.0);
+  // 分数归一化到 [0, 1]；这些参数集中定义，避免和筛选阈值分散在不同位置。
+  const double circularity_score = std::clamp(
+    (c.circularity - kScoreCircularityStart) / kScoreCircularityRange, 0.0, 1.0);
+  const double aspect_score = std::clamp(
+    1.0 - std::abs(c.aspect_ratio - 1.0) / 0.20, 0.0, 1.0);
+  const double area_score = std::clamp(
+    1.0 - std::abs(c.area - kTargetArea) / kAreaScoreTolerance, 0.0, 1.0);
   return 0.45 * circularity_score + 0.35 * aspect_score + 0.20 * area_score;
 }
 
@@ -209,14 +233,14 @@ std::optional<BallCandidate> chooseBestCandidate(
       if (distance > max_distance) {
         continue;
       }
-      score -= distance * 0.01;
+      score -= distance * kDistancePenalty;
 
       // 半径突变过大 => 误匹配，拒绝
       const double radius_gap = std::abs(c.radius - previous.radius);
-      if (radius_gap > previous.radius * 0.45) {
+      if (radius_gap > previous.radius * kMaxRadiusChangeRatio) {
         continue;
       }
-      score -= radius_gap * 0.02;
+      score -= radius_gap * kRadiusPenalty;
     }
 
     if (score > best_score) {
@@ -236,7 +260,7 @@ std::string buildStatusText(double speed_pps, double delta_pps)
 {
   std::ostringstream ss;
   ss << std::fixed << std::setprecision(1) << "speed: " << speed_pps << " px/s";
-  if (std::abs(delta_pps) < 1e-3) {
+  if (std::abs(delta_pps) < kStableSpeedDeltaPps) {
     ss << "  stable";
   } else if (delta_pps > 0.0) {
     ss << "  accelerating";
@@ -280,24 +304,38 @@ void drawTrackOverlay(cv::Mat & frame, const BallTrack & current, const BallTrac
   const double prev_speed_pps = previous.speed * fps;
   const double delta_pps = speed_pps - prev_speed_pps;
 
-  cv::Point2f arrow = current.smooth_velocity;
-  if (cv::norm(arrow) < 1.0F) {
-    arrow = cv::Point2f(30.0F, 0.0F);  // 静止时给个默认方向，避免箭头消失
+  // 只有速度和方向都可信时才画箭头；静止时不伪造一个向右的方向。
+  const cv::Point2f arrow = current.smooth_velocity;
+  const double arrow_norm = cv::norm(arrow);
+  if (current.speed >= kMinArrowSpeed && arrow_norm > 1e-6) {
+    const double len = std::clamp(current.speed * kArrowScale, kArrowMinLen, kArrowMaxLen);
+    const cv::Point2f dir = arrow * static_cast<float>(len / arrow_norm);
+    const cv::Point2f end = current.center + dir;
+    cv::arrowedLine(frame, current.center, end, speedToColor(current.speed),
+      3, cv::LINE_AA, 0, 0.28);
   }
-
-  const double len = std::clamp(current.speed * kArrowScale, kArrowMinLen, kArrowMaxLen);
-  const cv::Point2f dir = arrow * static_cast<float>(len / cv::norm(arrow));
-  const cv::Point2f end = current.center + dir;
-  cv::arrowedLine(frame, current.center, end, speedToColor(current.speed), 3, cv::LINE_AA, 0, 0.28);
 
   const cv::Point anchor(std::max(20, current.bounding_box.x - 20),
     std::max(40, current.bounding_box.y - 16));
   cv::putText(frame, predicted ? "green ball predicted" : "green ball", anchor,
     cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
-  cv::putText(frame, buildStatusText(speed_pps, delta_pps), anchor + cv::Point(0, 28),
+
+  // 外推期间的速度只是沿用上次观测值；重获目标的第一帧也不计算跨越丢失区间的瞬时速度。
+  std::string status_text;
+  if (predicted) {
+    std::ostringstream ss;
+    ss << std::fixed << std::setprecision(1)
+       << "speed: ~" << speed_pps << " px/s  predicted";
+    status_text = ss.str();
+  } else if (previous.lost_frames > 0) {
+    status_text = "speed: recalibrating";
+  } else {
+    status_text = buildStatusText(speed_pps, delta_pps);
+  }
+  cv::putText(frame, status_text, anchor + cv::Point(0, 28),
     cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 255), 2, cv::LINE_AA);
 
-  // 球的大小标注（半径）
+  // 球的大小标注（图像中的像素半径，不是现实世界长度）
   const std::string size_text =
     "r: " + std::to_string(static_cast<int>(std::round(current.radius))) + " px";
   cv::putText(frame, size_text, anchor + cv::Point(0, 56),
@@ -318,22 +356,58 @@ int main(int argc, char ** argv)
   const std::filesystem::path input_path = argc > 1 ? argv[1] : default_input;
   const std::filesystem::path output_path = argc > 2 ? argv[2] : default_output;
 
+  // 防止输入、输出指向同一路径，避免打开写入器时覆盖输入视频。
+  try {
+    const auto absolute_input = std::filesystem::absolute(input_path).lexically_normal();
+    const auto absolute_output = std::filesystem::absolute(output_path).lexically_normal();
+    if (absolute_input == absolute_output) {
+      std::cerr << "输入视频和输出视频不能是同一个路径。" << std::endl;
+      return 1;
+    }
+  } catch (const std::filesystem::filesystem_error & e) {
+    std::cerr << "检查文件路径失败: " << e.what() << std::endl;
+    return 1;
+  }
+
   cv::VideoCapture capture(input_path.string());
   if (!capture.isOpened()) {
     std::cerr << "无法打开输入视频: " << input_path << std::endl;
     return 1;
   }
 
-  const double fps = capture.get(cv::CAP_PROP_FPS);
+  const double reported_fps = capture.get(cv::CAP_PROP_FPS);
   const int width = static_cast<int>(capture.get(cv::CAP_PROP_FRAME_WIDTH));
   const int height = static_cast<int>(capture.get(cv::CAP_PROP_FRAME_HEIGHT));
 
-  std::filesystem::create_directories(output_path.parent_path());
+  if (width <= 0 || height <= 0) {
+    std::cerr << "输入视频的宽度或高度无效: " << width << "x" << height << std::endl;
+    return 1;
+  }
+
+  const bool fps_is_valid = std::isfinite(reported_fps) && reported_fps > 0.0;
+  const double fps = fps_is_valid ? reported_fps : kDefaultFps;
+  if (!fps_is_valid) {
+    std::cerr << "警告：无法从视频读取有效 FPS，将按 " << kDefaultFps
+              << " FPS 处理；显示的 px/s 速度可能不准确。" << std::endl;
+  }
+
+  // 仅当路径包含目录时创建父目录；输出为当前目录下的文件名时不传空路径。
+  const std::filesystem::path output_parent = output_path.parent_path();
+  if (!output_parent.empty()) {
+    std::error_code ec;
+    std::filesystem::create_directories(output_parent, ec);
+    if (ec) {
+      std::cerr << "无法创建输出目录: " << output_parent
+                << "，原因: " << ec.message() << std::endl;
+      return 1;
+    }
+  }
 
   cv::VideoWriter writer(output_path.string(), cv::VideoWriter::fourcc('m', 'p', '4', 'v'),
-    fps > 0.0 ? fps : 30.0, cv::Size(width, height));
+    fps, cv::Size(width, height));
   if (!writer.isOpened()) {
-    std::cerr << "无法创建输出视频: " << output_path << std::endl;
+    std::cerr << "无法创建输出视频: " << output_path
+              << "。请检查路径、写入权限以及当前 OpenCV 的视频编码器支持。" << std::endl;
     return 1;
   }
 
@@ -342,6 +416,11 @@ int main(int argc, char ** argv)
   int frame_index = 0;
 
   for (cv::Mat frame; capture.read(frame); ++frame_index) {
+    if (frame.empty()) {
+      std::cerr << "警告：第 " << frame_index << " 帧为空，停止处理。" << std::endl;
+      break;
+    }
+
     const auto candidates = detectBallCandidates(frame);
     const auto selected = chooseBestCandidate(candidates, previous);
 
@@ -353,11 +432,14 @@ int main(int argc, char ** argv)
       current.initialized = true;
       current.lost_frames = 0;
 
-      if (previous.initialized) {
+      // 若上一帧是外推位置，不能把“重获目标时的位置差”当成普通相邻帧位移。
+      // 重获的第一帧先重置速度估计，下一帧再恢复正常计算，避免出现虚假的速度尖峰。
+      if (previous.initialized && previous.lost_frames == 0) {
         const cv::Point2f raw_velocity = current.center - previous.center;
         current.velocity = raw_velocity;
         current.smooth_velocity =
-          kSmoothAlpha * raw_velocity + (1.0 - kSmoothAlpha) * previous.smooth_velocity;
+          static_cast<float>(kSmoothAlpha) * raw_velocity +
+          static_cast<float>(1.0 - kSmoothAlpha) * previous.smooth_velocity;
       } else {
         current.velocity = cv::Point2f(0.0F, 0.0F);
         current.smooth_velocity = cv::Point2f(0.0F, 0.0F);
@@ -372,7 +454,7 @@ int main(int argc, char ** argv)
       drawTrackOverlay(frame, current, previous, fps, frame_index, false);
       previous = current;
     } else if (previous.initialized && previous.lost_frames < kMaxLostFrames) {
-      // 短时丢失：用上一帧速度外推，避免贴边瞬间中断
+      // 短时丢失：按上一帧速度外推。注意这只是预测，不是实际检测结果。
       BallTrack predicted = previous;
       predicted.center = clampPointToFrame(previous.center + previous.velocity, frame.size());
       predicted.bounding_box.x = static_cast<int>(std::round(predicted.center.x - predicted.radius));
@@ -398,6 +480,12 @@ int main(int argc, char ** argv)
     writer.write(frame);
   }
 
-  std::cout << "已写入标注视频: " << output_path << std::endl;
+  if (frame_index == 0) {
+    std::cerr << "输入视频没有可读取的帧，未生成有效输出。" << std::endl;
+    return 1;
+  }
+
+  std::cout << "已写入标注视频: " << output_path
+            << "（处理帧数: " << frame_index << ")" << std::endl;
   return 0;
 }
